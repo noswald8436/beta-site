@@ -1,0 +1,12 @@
+{
+  "name": "beta-site",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Interactive site with a whitelisted command API",
+  "scripts": {
+    "start": "node server/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
