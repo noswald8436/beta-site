@@ -1,163 +1,294 @@
 (() => {
   'use strict';
+
   const $ = (id) => document.getElementById(id);
-  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const prefersReducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const API_TIMEOUT_MS = 6500;
+  const MAX_LOG_LINES = 160;
+  const HISTORY_LIMIT = 40;
 
-  // ---- matrix background ----
-  const canvas = $('matrix');
-  const ctx = canvas.getContext('2d');
-  const glyphs = '01<>/\\{}[]+-*=#$%&';
-  let cols = 0;
-  let drops = [];
+  const apiPill = $('api-pill');
+  const apiLabel = $('api-label');
+  const output = $('out');
+  const form = $('form');
+  const input = $('cmd');
+  const runButton = $('run-btn');
+  const spark = $('spark');
+  const loadHistory = [];
+  const commandHistory = [];
+  let historyIndex = 0;
+  let requestInFlight = false;
 
-  function resizeMatrix() {
-    canvas.width = innerWidth;
-    canvas.height = innerHeight;
-    cols = Math.ceil(canvas.width / 16);
-    drops = Array.from({ length: cols }, () => Math.random() * -60);
+  function setApiState(state, label) {
+    if (apiPill) apiPill.dataset.state = state;
+    if (apiLabel) apiLabel.textContent = label;
   }
 
-  function drawMatrix() {
-    ctx.fillStyle = 'rgba(4, 7, 5, 0.12)';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#39ff88';
-    ctx.font = '14px ui-monospace, Menlo, Consolas, monospace';
-    for (let i = 0; i < cols; i++) {
-      const ch = glyphs[Math.floor(Math.random() * glyphs.length)];
-      ctx.fillText(ch, i * 16, drops[i] * 16);
-      if (drops[i] * 16 > canvas.height && Math.random() > 0.975) drops[i] = 0;
-      drops[i] += 1;
+  async function requestJson(url, options) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, Object.assign({ cache: 'no-store', signal: controller.signal }, options || {}));
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || ('HTTP ' + response.status));
+      return data;
+    } finally {
+      window.clearTimeout(timeout);
     }
   }
 
-  addEventListener('resize', resizeMatrix);
-  resizeMatrix();
-  if (!reduce) setInterval(drawMatrix, 60);
+  // Ambient matrix effect: capped for battery use and disabled for reduced-motion users.
+  const matrix = $('matrix');
+  const matrixContext = matrix ? matrix.getContext('2d') : null;
+  const glyphs = '01<>/\\{}[]+-*=#$%&';
+  let matrixWidth = 0;
+  let matrixHeight = 0;
+  let matrixScale = 1;
+  let drops = [];
+  let matrixTimer = 0;
 
-  // ---- system panel ----
-  const HISTORY = 60;          // points kept for the load graph
-  const loadHistory = [];
-  const spark = $('spark');
-  const sctx = spark.getContext('2d');
-
-  function drawSpark() {
-    const w = spark.width;
-    const h = spark.height;
-    sctx.clearRect(0, 0, w, h);
-    if (loadHistory.length < 2) return;
-    const max = Math.max(0.5, ...loadHistory) * 1.2;
-    const n = loadHistory.length;
-    sctx.beginPath();
-    loadHistory.forEach((v, i) => {
-      // newest point sits on the right edge
-      const x = w - ((n - 1 - i) / (HISTORY - 1)) * w;
-      const y = h - (v / max) * (h - 4) - 2;
-      if (i === 0) sctx.moveTo(x, y); else sctx.lineTo(x, y);
-    });
-    sctx.strokeStyle = '#39ff88';
-    sctx.lineWidth = 2;
-    sctx.shadowColor = '#39ff88';
-    sctx.shadowBlur = 8;
-    sctx.stroke();
+  function resizeMatrix() {
+    if (!matrix || !matrixContext) return;
+    matrixWidth = window.innerWidth;
+    matrixHeight = window.innerHeight;
+    matrixScale = Math.min(window.devicePixelRatio || 1, 1.6);
+    matrix.width = Math.max(1, Math.round(matrixWidth * matrixScale));
+    matrix.height = Math.max(1, Math.round(matrixHeight * matrixScale));
+    matrixContext.setTransform(matrixScale, 0, 0, matrixScale, 0, 0);
+    const columns = Math.ceil(matrixWidth / 19);
+    drops = Array.from({ length: columns }, () => Math.random() * -35);
   }
 
-  function fmtSeconds(s) {
-    const d = Math.floor(s / 86400);
-    const h = Math.floor((s % 86400) / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    return `${d}d ${h}h ${m}m`;
+  function drawMatrix() {
+    if (!matrixContext) return;
+    matrixContext.fillStyle = 'rgba(5, 12, 8, 0.16)';
+    matrixContext.fillRect(0, 0, matrixWidth, matrixHeight);
+    matrixContext.fillStyle = 'rgba(143, 255, 178, 0.72)';
+    matrixContext.font = '13px ui-monospace, Menlo, Consolas, monospace';
+    for (let i = 0; i < drops.length; i += 1) {
+      const char = glyphs[Math.floor(Math.random() * glyphs.length)];
+      matrixContext.fillText(char, i * 19, drops[i] * 17);
+      if (drops[i] * 17 > matrixHeight && Math.random() > 0.978) drops[i] = 0;
+      drops[i] += 0.72;
+    }
+  }
+
+  function syncMatrix() {
+    window.clearInterval(matrixTimer);
+    if (!prefersReducedMotion && !document.hidden) matrixTimer = window.setInterval(drawMatrix, 78);
+  }
+
+  resizeMatrix();
+  syncMatrix();
+  window.addEventListener('resize', resizeMatrix, { passive: true });
+  document.addEventListener('visibilitychange', syncMatrix);
+
+  function formatUptime(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value < 0) return '—';
+    const days = Math.floor(value / 86400);
+    const hours = Math.floor((value % 86400) / 3600);
+    const minutes = Math.floor((value % 3600) / 60);
+    return days + 'd ' + hours + 'h ' + minutes + 'm';
+  }
+
+  function resizeSpark() {
+    if (!spark) return;
+    const rect = spark.getBoundingClientRect();
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    spark.width = Math.max(1, Math.round(rect.width * ratio));
+    spark.height = Math.max(1, Math.round(rect.height * ratio));
+    drawSpark();
+  }
+
+  function drawSpark() {
+    if (!spark) return;
+    const context = spark.getContext('2d');
+    if (!context) return;
+    const rect = spark.getBoundingClientRect();
+    const ratio = Math.min(window.devicePixelRatio || 1, 2);
+    const width = rect.width;
+    const height = rect.height;
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, width, height);
+    context.strokeStyle = 'rgba(155, 181, 162, 0.16)';
+    context.lineWidth = 1;
+    context.beginPath();
+    context.moveTo(0, height - 1);
+    context.lineTo(width, height - 1);
+    context.stroke();
+    if (loadHistory.length < 2) return;
+
+    const pad = 8;
+    const max = Math.max(0.5, ...loadHistory) * 1.2;
+    const xAt = (index) => pad + (index / Math.max(1, loadHistory.length - 1)) * (width - pad * 2);
+    const yAt = (value) => height - pad - (value / max) * (height - pad * 2);
+    context.beginPath();
+    loadHistory.forEach((value, index) => {
+      const x = xAt(index);
+      const y = yAt(value);
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    });
+    context.strokeStyle = '#8fffb2';
+    context.lineWidth = 2;
+    context.shadowColor = 'rgba(87, 217, 154, 0.48)';
+    context.shadowBlur = 9;
+    context.stroke();
+    context.shadowBlur = 0;
+    const lastIndex = loadHistory.length - 1;
+    context.beginPath();
+    context.arc(xAt(lastIndex), yAt(loadHistory[lastIndex]), 3, 0, Math.PI * 2);
+    context.fillStyle = '#c7ffd5';
+    context.fill();
+  }
+
+  function setMetric(id, value) {
+    const element = $(id);
+    if (element) element.textContent = value;
   }
 
   async function refreshStats() {
     try {
-      const r = await fetch('/api/status', { cache: 'no-store' });
-      if (!r.ok) throw new Error(`status ${r.status}`);
-      const s = await r.json();
-      $('s-uptime').textContent = fmtSeconds(s.uptimeSeconds);
-      $('s-load').textContent = s.loadavg.map((n) => n.toFixed(2)).join('  ');
-      $('s-mem').textContent = `${s.memUsedMiB} / ${s.memTotalMiB} MiB`;
-      $('s-cores').textContent = s.cores;
-      $('s-node').textContent = s.node;
-      $('s-time').textContent = new Date(s.time).toLocaleTimeString();
-      loadHistory.push(s.loadavg[0]);
-      if (loadHistory.length > HISTORY) loadHistory.shift();
+      const status = await requestJson('/api/status');
+      if (!Array.isArray(status.loadavg)) throw new Error('Invalid status response');
+      setMetric('s-uptime', formatUptime(status.uptimeSeconds));
+      setMetric('s-load', status.loadavg.map((value) => Number(value).toFixed(2)).join(' / '));
+      setMetric('s-mem', Number(status.memUsedMiB).toLocaleString() + ' / ' + Number(status.memTotalMiB).toLocaleString() + ' MiB');
+      setMetric('s-cores', String(status.cores));
+      setMetric('s-node', String(status.node));
+      setMetric('s-time', new Date(status.time).toLocaleTimeString());
+      const lastUpdated = $('last-updated');
+      if (lastUpdated) lastUpdated.textContent = 'Updated ' + new Date().toLocaleTimeString();
+      loadHistory.push(Number(status.loadavg[0]) || 0);
+      if (loadHistory.length > 60) loadHistory.shift();
       drawSpark();
-    } catch {
-      $('s-uptime').textContent = 'offline';
+      setApiState('online', 'API ONLINE');
+      return true;
+    } catch (error) {
+      ['s-uptime', 's-load', 's-mem', 's-cores', 's-node', 's-time'].forEach((id) => setMetric(id, '—'));
+      const lastUpdated = $('last-updated');
+      if (lastUpdated) lastUpdated.textContent = 'Metrics unavailable';
+      setApiState('offline', 'API OFFLINE');
+      return false;
     }
   }
-  refreshStats();
-  setInterval(refreshStats, 5000);
 
-  // ---- terminal ----
-  const out = $('out');
-  const form = $('form');
-  const input = $('cmd');
-  const past = [];
-  let pIdx = 0;
-
-  function print(text, cls = '') {
+  function addLine(text, kind) {
+    if (!output) return;
     const line = document.createElement('div');
-    line.className = cls;
-    line.textContent = text; // textContent only: output is never parsed as HTML
-    out.appendChild(line);
-    out.scrollTop = out.scrollHeight;
+    line.className = 'line' + (kind ? ' line-' + kind : '');
+    line.textContent = String(text);
+    output.appendChild(line);
+    while (output.children.length > MAX_LOG_LINES) output.removeChild(output.firstElementChild);
+    output.scrollTop = output.scrollHeight;
   }
 
-  async function boot() {
-    const lines = [
-      'beta // booting ...',
-      'attaching tunnel ............ ok',
-      'starting api on loopback .... ok',
-      'type "help" to see what you can run.',
-    ];
-    for (const l of lines) {
-      print(l, 'dim');
-      if (!reduce) await sleep(220);
+  async function bootTerminal() {
+    addLine('beta // interactive console', 'dim');
+    addLine('checking API connection…', 'dim');
+    try {
+      const health = await requestJson('/api/health');
+      if (health.status !== 'ok') throw new Error('Health check did not return ok');
+      setApiState('online', 'API ONLINE');
+      addLine('API link established. Type "help" to explore.', 'success');
+    } catch (error) {
+      setApiState('offline', 'API OFFLINE');
+      addLine('The page is up, but the API did not respond. Try again in a moment.', 'error');
     }
+    await refreshStats();
   }
-  boot();
 
-  async function runCommand(cmd) {
-    if (cmd === 'clear') {       // client-side only: wipes the screen
-      out.textContent = '';
+  async function runCommand(command) {
+    const normalized = command.trim();
+    if (!normalized || requestInFlight) return;
+    if (normalized.toLowerCase() === 'clear') {
+      if (output) output.textContent = '';
+      addLine('screen cleared', 'dim');
       return;
     }
-    print(`guest@beta:~$ ${cmd}`, 'cmd');
+
+    addLine('guest@beta:~$ ' + normalized, 'command');
+    requestInFlight = true;
+    if (form) form.setAttribute('aria-busy', 'true');
+    if (runButton) runButton.disabled = true;
+    if (input) input.disabled = true;
+
     try {
-      const r = await fetch('/api/run', {
+      const result = await requestJson('/api/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cmd }),
+        body: JSON.stringify({ cmd: normalized })
       });
-      const data = await r.json();
-      if (r.ok) print(data.output);
-      else print(data.error || `request failed (${r.status})`, 'err');
-    } catch {
-      print('network error', 'err');
+      addLine(result.output == null ? '' : result.output);
+      setApiState('online', 'API ONLINE');
+    } catch (error) {
+      const message = error && error.message ? error.message : 'network error';
+      addLine(message === 'Failed to fetch' ? 'Could not reach the API.' : message, 'error');
+      setApiState('offline', 'API OFFLINE');
+    } finally {
+      requestInFlight = false;
+      if (form) form.removeAttribute('aria-busy');
+      if (runButton) runButton.disabled = false;
+      if (input) {
+        input.disabled = false;
+        input.focus();
+      }
     }
   }
 
-  form.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const cmd = input.value.trim();
-    input.value = '';
-    if (!cmd) return;
-    past.push(cmd);
-    pIdx = past.length;
-    runCommand(cmd);
+  function submitCommand(command) {
+    const value = String(command || '').trim();
+    if (!value || requestInFlight) return;
+    commandHistory.push(value);
+    if (commandHistory.length > HISTORY_LIMIT) commandHistory.shift();
+    historyIndex = commandHistory.length;
+    if (input) input.value = '';
+    runCommand(value);
+  }
+
+  if (form) {
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      submitCommand(input ? input.value : '');
+    });
+  }
+
+  if (input) {
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowUp') {
+        if (historyIndex > 0) {
+          historyIndex -= 1;
+          input.value = commandHistory[historyIndex];
+        }
+        event.preventDefault();
+      } else if (event.key === 'ArrowDown') {
+        if (historyIndex < commandHistory.length - 1) {
+          historyIndex += 1;
+          input.value = commandHistory[historyIndex];
+        } else {
+          historyIndex = commandHistory.length;
+          input.value = '';
+        }
+        event.preventDefault();
+      } else if (event.key === 'Escape') {
+        input.value = '';
+      }
+    });
+  }
+
+  document.querySelectorAll('[data-command]').forEach((button) => {
+    button.addEventListener('click', () => submitCommand(button.dataset.command));
   });
 
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'ArrowUp') {
-      if (pIdx > 0) { pIdx -= 1; input.value = past[pIdx]; }
-      e.preventDefault();
-    } else if (e.key === 'ArrowDown') {
-      if (pIdx < past.length) { pIdx += 1; input.value = past[pIdx] || ''; }
-      e.preventDefault();
-    }
+  const clearButton = $('clear-output');
+  if (clearButton) clearButton.addEventListener('click', () => {
+    if (output) output.textContent = '';
+    if (input) input.focus();
   });
 
-  out.addEventListener('click', () => input.focus());
+  resizeSpark();
+  window.addEventListener('resize', resizeSpark, { passive: true });
+  bootTerminal();
+  window.setInterval(refreshStats, 15000);
 })();
